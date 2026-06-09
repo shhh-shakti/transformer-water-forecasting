@@ -4,6 +4,34 @@ import numpy as np
 import joblib
 import plotly.express as px
 import plotly.graph_objects as go
+import io
+from datetime import datetime
+
+def create_sample_df(n=30, seed=42):
+    """Create a realistic hydrological sample dataframe with n rows.
+
+    Columns: Date (DD/MM/YYYY), Rainfall (mm), Water Level (m)
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    _np.random.seed(seed)
+    today = datetime.today()
+    rows = []
+    base_level = 30.0
+    trend = 0.02  # slight upward trend over period
+    for i in range(n):
+        d = (today.replace(hour=0, minute=0, second=0, microsecond=0) - _pd.Timedelta(days=n - 1 - i))
+        # rainfall: realistic daily mm values (including zeros)
+        rain = float(max(0.0, _np.random.gamma(shape=1.2, scale=6.0)))
+        # water level: base + small trend + response to recent rainfall + noise
+        wl = base_level + (i * trend) + (rain * 0.03) + float(_np.random.normal(loc=0.0, scale=0.25))
+        rows.append({
+            "Date": d.strftime("%d/%m/%Y"),
+            "Rainfall": round(rain, 2),
+            "Water Level": round(wl, 3),
+        })
+    return _pd.DataFrame(rows)
 
 from tensorflow.keras.models import load_model
 
@@ -781,7 +809,31 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Drop Excel dataset here",
         type=["xlsx", "xls"],
-        help="Input file must include the columns: wl and imerg.",
+        help="Input file must include the columns: Date, Rainfall, Water Level (case-sensitive).",
+    )
+
+    # Provide sample Excel for users (generated on-the-fly)
+    def make_sample_excel_bytes():
+        # create forecasting-ready sample (30 rows)
+        sample_df = create_sample_df(n=30)
+        towrite = io.BytesIO()
+        with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
+            sample_df.to_excel(writer, index=False, sheet_name="sample")
+        return towrite.getvalue()
+
+    sample_bytes = make_sample_excel_bytes()
+    st.download_button(
+        label="📥 Download Sample Excel File",
+        data=sample_bytes,
+        file_name="sample_input.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("Sample dataset is fully compatible with the forecasting model and can be used for demonstration purposes.")
+
+    # Professional disclaimer in sidebar
+    st.markdown("---")
+    st.warning(
+        "⚠ This forecasting model has been trained specifically for the Kosi River Basin and should not be used for any other river basin."
     )
 
     st.markdown("### Forecast Settings")
@@ -803,6 +855,8 @@ with st.sidebar:
         "Cinematic research dashboard for flood and river-level intelligence forecasting."
     )
 
+    # Keep AI control compact
+
 
 # ============================================================
 # UPLOAD PANEL AND PREPROCESSING
@@ -817,94 +871,293 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- prepare for new UX: main tabs: Forecast and User Guidelines
+main_tab_1, main_tab_2 = st.tabs(["Forecast", "User Guidelines"])
+
 result_df = None
 df = None
+# Small-data diagnostics
+small_data_issue = False
+uploaded_rows = None
+rows_after_preprocessing = None
+required_rows_for_prediction = None
 
-if uploaded_file is not None:
-    # Read uploaded dataset from Excel.
-    df = pd.read_excel(uploaded_file)
+with main_tab_1:
+    # Upload handling and validations
+    if uploaded_file is not None:
+        try:
+            df = pd.read_excel(uploaded_file)
+        except Exception:
+            st.error("❌ Unable to read the Excel file. Please provide a valid .xlsx/.xls file.")
 
-    # Validate required columns before running feature creation.
-    required_cols = {"wl", "imerg"}
-    if not required_cols.issubset(df.columns):
-        st.error("Dataset must contain columns: wl and imerg.")
+        # Validate exact required column names (case-sensitive)
+        required_cols = ["Date", "Rainfall", "Water Level"]
+        if df is None:
+            pass
+        elif not set(required_cols).issubset(set(df.columns)):
+            st.error("❌ Invalid file format.\nRequired columns: Date, Rainfall, Water Level")
+        else:
+            # Basic validations
+            # 1) Minimum rows
+            if len(df) < 8:
+                st.error("❌ Minimum 8 continuous days of observations required.")
+            # 2) Missing values
+            elif df[required_cols].isnull().any().any():
+                st.error("❌ Missing values detected. Please upload a complete dataset.")
+            else:
+                # 3) Date format DD/MM/YYYY and chronological order
+                date_strings = df["Date"].astype(str).tolist()
+                parsed_dates = []
+                bad_format = False
+                for d in date_strings:
+                    try:
+                        # Enforce exact DD/MM/YYYY
+                        parsed = datetime.strptime(d, "%d/%m/%Y")
+                        parsed_dates.append(parsed)
+                    except Exception:
+                        bad_format = True
+                        break
+
+                if bad_format:
+                    st.error("❌ Invalid date format. Required format: DD/MM/YYYY")
+                else:
+                    # Chronological check
+                    if any(parsed_dates[i] >= parsed_dates[i + 1] for i in range(len(parsed_dates) - 1)):
+                        st.error("❌ Dates must be arranged in chronological order.")
+                    else:
+                        # Passed validations — show preview and map columns for internal pipeline
+                        st.success("✅ File uploaded successfully")
+                        st.markdown(f"- **Number of records:** {len(df)}")
+                        st.markdown(f"- **Start date:** {parsed_dates[0].strftime('%d/%m/%Y')}")
+                        st.markdown(f"- **End date:** {parsed_dates[-1].strftime('%d/%m/%Y')}")
+                        st.dataframe(df.head(12), use_container_width=True)
+
+                        # Map user-facing columns to internal names used by feature pipeline
+                        # Water Level -> wl ; Rainfall -> imerg
+                        proc_df = df.copy()
+                        proc_df = proc_df.rename(columns={"Water Level": "wl", "Rainfall": "imerg"})
+
+                        # Feature engineering consistent with existing ML pipeline.
+                        for i in range(1, 6):
+                            proc_df[f"wl_lag{i}"] = proc_df["wl"].shift(i)
+
+                        proc_df["wl_roll3"] = proc_df["wl"].rolling(3).mean()
+                        proc_df.dropna(inplace=True)
+                        # expose processed dataframe for downstream visualization
+                        processed_df = proc_df.reset_index(drop=True)
+
+                        # Build feature matrix in original order.
+                        features = ["imerg"] + [f"wl_lag{i}" for i in range(1, 6)] + ["wl_roll3"]
+                        X = proc_df[features].values
+
+                        # Apply scaler from persisted artifact.
+                        try:
+                            X_scaled = scaler.transform(X)
+                        except Exception:
+                            st.error("❌ Error applying internal scaler. Please contact the administrator.")
+                            X_scaled = None
+
+                        if X_scaled is not None:
+                            # Build sequence tensor expected by transformer model.
+                            sequence_length = 10
+                            X_seq = []
+                            for i in range(sequence_length, len(X_scaled)):
+                                X_seq.append(X_scaled[i - sequence_length : i])
+                            X_seq = np.array(X_seq)
+
+                            # Diagnostics for small datasets
+                            uploaded_rows = len(df)
+                            rows_after_preprocessing = len(proc_df)
+                            # model-specific offsets
+                            max_lag = 5
+                            roll_window = 3
+                            sequence_length = 10
+                            required_rows_for_prediction = max(max_lag, roll_window - 1) + sequence_length + 1
+
+                            # Require enough records to create at least one sequence.
+                            if len(X_seq) == 0:
+                                small_data_issue = True
+                                # Professional warning card with counts and recommendation
+                                st.markdown(
+                                    f"""
+                                    <div class="glass-card" style="border-left:4px solid #ffb86b; margin-bottom:12px;">
+                                        <h4 style="margin:0 0 6px 0;">Forecast generation unavailable</h4>
+                                        <p style="margin:0; color:#f0e9e1">Forecast generation unavailable because the uploaded dataset contains only <strong>{uploaded_rows}</strong> rows. The current Transformer model requires at least <strong>{required_rows_for_prediction}</strong> rows to create valid prediction sequences.</p>
+                                        <div style="margin-top:8px; color:#cfeefc">Rows after preprocessing: <strong>{rows_after_preprocessing}</strong></div>
+                                        <div style="margin-top:8px; color:#ffdcb3; font-weight:600">Recommendation: Please upload at least 20 rows of historical observations for successful forecasting.</div>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+
+                                # Explain why this happens
+                                st.markdown(
+                                    """
+                                    <div class="glass-card" style="margin-bottom:12px;">
+                                        <h5 style="margin-top:0;">Why This Happens</h5>
+                                        <ul>
+                                            <li>Lag features consume historical rows (5 lag features reduce available rows).</li>
+                                            <li>Rolling averages consume rows (3-point rolling mean reduces initial rows).</li>
+                                            <li>Sequence generation requires a historical sequence length of 10 steps to create model input tensors.</li>
+                                        </ul>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+
+                            # Run prediction when the sidebar button is triggered.
+                            if generate_clicked and len(X_seq) > 0:
+                                loader_slot = st.empty()
+                                loader_slot.markdown(
+                                    """
+                                    <div class="loader-panel">
+                                        <div class="loader-ring"></div>
+                                        <div class="loader-text">
+                                            Transformer inference in progress...
+                                            <div class="loader-sub">Synthesizing multi-horizon hydrological intelligence</div>
+                                        </div>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                                try:
+                                    predictions = model.predict(X_seq, verbose=0)
+                                except Exception:
+                                    loader_slot.empty()
+                                    st.error("❌ Prediction failed. Please try again or contact support.")
+                                    predictions = None
+                                loader_slot.empty()
+
+                                if predictions is not None:
+                                    result_df = pd.DataFrame(
+                                        predictions,
+                                        columns=["Lead_1", "Lead_3", "Lead_5", "Lead_7", "Lead_10"],
+                                    )
+
+                                    st.success("Forecast generated successfully.")
+
     else:
-        st.markdown("### Dataset Overview")
-        st.dataframe(df.head(), use_container_width=True)
+        # Initial landing guidance — premium glass cards
+        st.markdown(
+            """
+            <div class="glass-card" style="margin-bottom: 12px;">
+                <h3 style="margin:0;">How To Use</h3>
+                <ol style="margin-top:6px;">
+                    <li>Download Sample File</li>
+                    <li>Prepare Excel with: Date, Rainfall, Water Level (DD/MM/YYYY)</li>
+                    <li>Upload Excel file</li>
+                    <li>Click Generate Forecast</li>
+                    <li>View forecast outputs</li>
+                    <li>Download prediction CSV</li>
+                </ol>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # Feature engineering consistent with existing ML pipeline.
-        for i in range(1, 6):
-            df[f"wl_lag{i}"] = df["wl"].shift(i)
-
-        df["wl_roll3"] = df["wl"].rolling(3).mean()
-        df.dropna(inplace=True)
-
-        # Build feature matrix in original order.
-        features = ["imerg"] + [f"wl_lag{i}" for i in range(1, 6)] + ["wl_roll3"]
-        X = df[features].values
-
-        # Apply scaler from persisted artifact.
-        X_scaled = scaler.transform(X)
-
-        # Build sequence tensor expected by transformer model.
-        sequence_length = 10
-        X_seq = []
-        for i in range(sequence_length, len(X_scaled)):
-            X_seq.append(X_scaled[i - sequence_length : i])
-        X_seq = np.array(X_seq)
-
-        # Require enough records to create at least one sequence.
-        if len(X_seq) == 0:
-            st.warning("Not enough rows after preprocessing. Please upload a larger dataset.")
-
-        # Run prediction when the sidebar button is triggered.
-        if generate_clicked and len(X_seq) > 0:
-            loader_slot = st.empty()
-            loader_slot.markdown(
-                """
-                <div class="loader-panel">
-                    <div class="loader-ring"></div>
-                    <div class="loader-text">
-                        Transformer inference in progress...
-                        <div class="loader-sub">Synthesizing multi-horizon hydrological intelligence</div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            predictions = model.predict(X_seq, verbose=0)
-            loader_slot.empty()
-
-            result_df = pd.DataFrame(
-                predictions,
-                columns=["Lead_1", "Lead_3", "Lead_5", "Lead_7", "Lead_10"],
-            )
-
-            st.success("Forecast generated successfully.")
+    # Keep footer download/export available if results present; handled later.
 
 
 # ============================================================
 # DASHBOARD CONTENT
 # ============================================================
-if result_df is not None:
-    tab_overview, tab_charts, tab_research = st.tabs(
-        ["Prediction Dashboard", "Visualization", "AI Research Insights"]
+with main_tab_2:
+    st.markdown("**User Guidelines**")
+    st.markdown(
+        """
+        <div class="glass-card" style="margin-bottom:14px;">
+            <h3 style="margin:0 0 6px 0;">Kosi River Basin Water Level Forecasting System</h3>
+            <p style="margin:0; color:#cfeefc">This forecasting system is specifically developed for the Kosi River Basin using a Transformer Neural Network trained on historical hydro-meteorological observations.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+
+    with st.container():
+        col1, col2 = st.columns([3,2])
+        with col1:
+            st.markdown(
+                """
+                <div class="glass-card">
+                    <h4 style="margin-top:0;">System Description</h4>
+                    <ul style="margin-top:6px;">
+                        <li>Model inputs: Rainfall observations and Historical Water Level observations</li>
+                        <li>Produces: 1-Day, 3-Day, 5-Day, 7-Day and 10-Day forecasts</li>
+                    </ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col2:
+            # provide forecasting-ready sample for download (30 rows)
+            sample_df = create_sample_df(n=30)
+            towrite = io.BytesIO()
+            with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
+                sample_df.to_excel(writer, index=False, sheet_name="sample")
+            st.download_button(
+                label="📥 Download Sample Excel File",
+                data=towrite.getvalue(),
+                file_name="sample_input.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.caption("Sample dataset is fully compatible with the forecasting model and can be used for demonstration purposes.")
+
+    st.markdown("---")
+    st.markdown(
+        """
+        <div class="glass-card">
+            <h4 style="margin-top:0;">Input Requirements</h4>
+            <p>Uploaded Excel files must contain the following exact column names (case-sensitive):</p>
+            <ul>
+                <li>Date (DD/MM/YYYY)</li>
+                <li>Rainfall</li>
+                <li>Water Level</li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="glass-card" style="margin-top:12px;">
+            <h4 style="margin-top:0;">Dataset Requirements</h4>
+            <p>Minimum rows required for the model to produce at least one prediction: <strong>16 rows</strong>.</p>
+            <p>Recommended rows for robust forecasting: <strong>20+ rows</strong>.</p>
+            <p>This accounts for lag feature creation, rolling averages, and the transformer's sequence length.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.warning("⚠ This forecasting model has been trained specifically for the Kosi River Basin and should not be used for any other river basin.")
+
+tab_overview, tab_charts, tab_research = st.tabs(
+    ["Prediction Dashboard", "Visualization", "AI Research Insights"]
+)
 
     # --------------------------------------------------------
     # TAB 1: FORECAST OUTPUT + METRICS
     # --------------------------------------------------------
-    with tab_overview:
-        st.markdown("### Multi-Horizon Prediction Output")
+with tab_overview:
+    st.markdown("### Multi-Horizon Prediction Output")
 
+    if result_df is not None:
         # Lead cards with futuristic typography and smooth hover effect.
         lead_cols = st.columns(5)
         lead_names = ["Lead_1", "Lead_3", "Lead_5", "Lead_7", "Lead_10"]
+        readable = {
+            "Lead_1": "1-Day Forecast",
+            "Lead_3": "3-Day Forecast",
+            "Lead_5": "5-Day Forecast",
+            "Lead_7": "7-Day Forecast",
+            "Lead_10": "10-Day Forecast",
+        }
         for idx, lead in enumerate(lead_names):
             with lead_cols[idx]:
                 st.markdown(
                     card_metric_html(
-                        f"{lead.replace('_', ' ')} Forecast",
+                        f"{readable.get(lead, lead)}",
                         f"{result_df[lead].iloc[-1]:.2f}",
                         "Last-step forecast",
                     ),
@@ -922,85 +1175,84 @@ if result_df is not None:
             st.metric("Minimum Prediction", f"{result_df.min().min():.2f}")
         with k3:
             st.metric("Average Prediction", f"{result_df.mean().mean():.2f}")
+    else:
+        # No predictions yet — show guidance and placeholders
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h4 style="margin:0 0 6px 0;">Forecasts are not available</h4>
+                <p style="margin:0; color:#e8f4f8">No forecasts generated yet. Upload a dataset and click <strong>Generate Forecast</strong> to run the Transformer model.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # If small-data, show the professional warning and diagnostics
+        if small_data_issue:
+            st.markdown(
+                f"""
+                <div class="glass-card" style="border-left:4px solid #ffb86b; margin-top:12px;">
+                    <h4 style="margin:0 0 6px 0;">Forecast generation unavailable</h4>
+                    <p style="margin:0;">Uploaded rows: <strong>{uploaded_rows}</strong></p>
+                    <p style="margin:0;">Rows after preprocessing: <strong>{rows_after_preprocessing}</strong></p>
+                    <p style="margin:0;">Required rows for prediction: <strong>{required_rows_for_prediction}</strong></p>
+                    <div style="margin-top:8px; color:#ffdcb3; font-weight:600">Recommendation: Please upload at least 20 rows of historical observations for successful forecasting.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                """
+                <div class="glass-card" style="margin-top:12px;">
+                    <h5 style="margin-top:0;">Why This Happens</h5>
+                    <ul>
+                        <li>Lag features consume historical rows (5 lag features reduce available rows).</li>
+                        <li>Rolling averages consume rows (3-point rolling mean reduces initial rows).</li>
+                        <li>Sequence generation requires a historical sequence length of 10 steps to create model input tensors.</li>
+                    </ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # Placeholder metrics/cards to keep layout stable
+        placeholder_cols = st.columns(5)
+        for c in placeholder_cols:
+            with c:
+                st.markdown(card_metric_html("--", "--", "No data"), unsafe_allow_html=True)
 
     # --------------------------------------------------------
     # TAB 2: CINEMATIC PLOTLY VISUALIZATION
     # --------------------------------------------------------
     with tab_charts:
-        st.markdown("### Forecast Visualization Matrix")
+            if result_df is not None:
+                st.markdown("### Forecast Visualization Matrix")
 
-        horizon_options = ["Lead_1", "Lead_3", "Lead_5", "Lead_7", "Lead_10"]
-        selected_horizons = st.multiselect(
-            "Visible Forecast Horizons",
-            options=horizon_options,
-            default=horizon_options,
-            help="Toggle horizons to isolate trend behavior.",
-        )
-        if not selected_horizons:
-            st.warning("Select at least one horizon to render the forecast chart.")
-            selected_horizons = ["Lead_1"]
-
-        # 1) Animated-feel multi-horizon line chart.
-        fig_forecast = go.Figure()
-        forecast_subset = result_df[selected_horizons].reset_index(drop=True)
-        x_axis = list(range(len(forecast_subset)))
-
-        # Background glow traces for subtle line bloom.
-        for lead in selected_horizons:
-            fig_forecast.add_trace(
-                go.Scatter(
-                    x=x_axis,
-                    y=forecast_subset[lead],
-                    mode="lines",
-                    name=f"{lead} Glow",
-                    line=dict(
-                        color=FORECAST_COLORS[lead],
-                        width=FORECAST_WIDTHS[lead] + 6,
-                        shape="spline",
-                        smoothing=1.1,
-                    ),
-                    opacity=0.12,
-                    hoverinfo="skip",
-                    showlegend=False,
+                horizon_options = ["Lead_1", "Lead_3", "Lead_5", "Lead_7", "Lead_10"]
+                selected_horizons = st.multiselect(
+                    "Visible Forecast Horizons",
+                    options=horizon_options,
+                    default=horizon_options,
+                    help="Toggle horizons to isolate trend behavior.",
                 )
-            )
+                if not selected_horizons:
+                    st.warning("Select at least one horizon to render the forecast chart.")
+                    selected_horizons = ["Lead_1"]
 
-        # Foreground lines with requested unique colors.
-        for lead in selected_horizons:
-            fig_forecast.add_trace(
-                go.Scatter(
-                    x=x_axis,
-                    y=forecast_subset[lead],
-                    mode="lines",
-                    name=lead,
-                    line=dict(
-                        color=FORECAST_COLORS[lead],
-                        width=FORECAST_WIDTHS[lead],
-                        shape="spline",
-                        smoothing=1.18,
-                    ),
-                    opacity=0.96,
-                    hovertemplate=(
-                        "<b>%{fullData.name}</b><br>"
-                        "Step: %{x}<br>"
-                        "Forecast: %{y:.3f}<extra></extra>"
-                    ),
-                )
-            )
+                # 1) Animated-feel multi-horizon line chart.
+                fig_forecast = go.Figure()
+                forecast_subset = result_df[selected_horizons].reset_index(drop=True)
+                x_axis = list(range(len(forecast_subset)))
 
-        # Animated line drawing effect.
-        frame_count = min(32, len(forecast_subset))
-        if frame_count > 2:
-            reveal_points = sorted(set(np.linspace(1, len(forecast_subset), frame_count, dtype=int)))
-            frames = []
-            for upto in reveal_points:
-                frame_data = []
+                # Background glow traces for subtle line bloom.
                 for lead in selected_horizons:
-                    frame_data.append(
+                    fig_forecast.add_trace(
                         go.Scatter(
-                            x=x_axis[:upto],
-                            y=forecast_subset[lead].iloc[:upto],
+                            x=x_axis,
+                            y=forecast_subset[lead],
                             mode="lines",
+                            name=f"{readable.get(lead, lead)} Glow",
                             line=dict(
                                 color=FORECAST_COLORS[lead],
                                 width=FORECAST_WIDTHS[lead] + 6,
@@ -1012,13 +1264,15 @@ if result_df is not None:
                             showlegend=False,
                         )
                     )
+
+                # Foreground lines with requested unique colors.
                 for lead in selected_horizons:
-                    frame_data.append(
+                    fig_forecast.add_trace(
                         go.Scatter(
-                            x=x_axis[:upto],
-                            y=forecast_subset[lead].iloc[:upto],
+                            x=x_axis,
+                            y=forecast_subset[lead],
                             mode="lines",
-                            name=lead,
+                            name=readable.get(lead, lead),
                             line=dict(
                                 color=FORECAST_COLORS[lead],
                                 width=FORECAST_WIDTHS[lead],
@@ -1033,90 +1287,84 @@ if result_df is not None:
                             ),
                         )
                     )
-                frames.append(go.Frame(data=frame_data, name=str(upto)))
-            fig_forecast.frames = frames
-            fig_forecast.update_layout(
-                updatemenus=[
-                    {
-                        "type": "buttons",
-                        "showactive": False,
-                        "x": 1,
-                        "y": 1.16,
-                        "xanchor": "right",
-                        "yanchor": "top",
-                        "buttons": [
-                            {
-                                "label": "Animate",
-                                "method": "animate",
-                                "args": [
-                                    None,
-                                    {
-                                        "frame": {"duration": 80, "redraw": False},
-                                        "fromcurrent": True,
-                                        "transition": {"duration": 130},
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                ]
-            )
 
-        fig_forecast.update_xaxes(title="Time Step", rangeslider=dict(visible=True, thickness=0.08))
-        fig_forecast.update_yaxes(title="Water Level Forecast")
-        apply_plot_theme(fig_forecast, "Animated Multi-Horizon Forecast")
-        st.plotly_chart(
-            fig_forecast,
-            use_container_width=True,
-            config={
-                "displaylogo": False,
-                "responsive": True,
-                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-            },
-        )
-
-        left_chart, right_chart = st.columns(2)
-
-        with left_chart:
-            # 2) Actual vs Predicted (Lead_1 as proxy).
-            aligned_actual = df["wl"].iloc[-len(result_df) :].reset_index(drop=True)
-            avp = go.Figure()
-            avp.add_trace(
-                go.Scatter(
-                    y=aligned_actual,
-                    mode="lines",
-                    name="Actual",
-                    line=dict(color="#b8d5e4", width=2.3, shape="spline"),
-                    opacity=0.85,
+                fig_forecast.update_xaxes(title="Time Step", rangeslider=dict(visible=True, thickness=0.08))
+                fig_forecast.update_yaxes(title="Water Level Forecast")
+                apply_plot_theme(fig_forecast, "Animated Multi-Horizon Forecast")
+                st.plotly_chart(
+                    fig_forecast,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "responsive": True,
+                        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                    },
                 )
-            )
-            avp.add_trace(
-                go.Scatter(
-                    y=result_df["Lead_1"],
-                    mode="lines",
-                    name="Predicted Lead_1",
-                    line=dict(color=FORECAST_COLORS["Lead_1"], width=3.4, dash="dash", shape="spline"),
-                    opacity=0.96,
+
+                left_chart, right_chart = st.columns(2)
+
+                with left_chart:
+                    # 2) Actual vs Predicted (Lead_1 as proxy).
+                    # align actuals from the processed dataset used by the model
+                    try:
+                        aligned_actual = processed_df["wl"].iloc[-len(result_df) :].reset_index(drop=True)
+                    except Exception:
+                        aligned_actual = None
+                    avp = go.Figure()
+                    if aligned_actual is not None:
+                        avp.add_trace(
+                            go.Scatter(
+                                y=aligned_actual,
+                                mode="lines",
+                                name="Actual",
+                                line=dict(color="#b8d5e4", width=2.3, shape="spline"),
+                                opacity=0.85,
+                            )
+                        )
+                    else:
+                        avp.add_trace(
+                            go.Scatter(y=[None], mode="lines", name="Actual", line=dict(color="#b8d5e4"))
+                        )
+                    avp.add_trace(
+                        go.Scatter(
+                            y=result_df["Lead_1"],
+                            mode="lines",
+                            name=readable.get("Lead_1", "Lead_1") + " (Predicted)",
+                            line=dict(color=FORECAST_COLORS["Lead_1"], width=3.4, dash="dash", shape="spline"),
+                            opacity=0.96,
+                        )
+                    )
+                    apply_plot_theme(avp, "Actual vs Predicted")
+                    st.plotly_chart(avp, use_container_width=True)
+
+                with right_chart:
+                    # 3) Horizon comparison chart with neon bars.
+                    horizon_mean = result_df.mean().reset_index()
+                    horizon_mean.columns = ["Horizon", "Mean Forecast"]
+
+                    bar_fig = px.bar(
+                        horizon_mean,
+                        x="Horizon",
+                        y="Mean Forecast",
+                        color="Horizon",
+                        color_discrete_map=FORECAST_COLORS,
+                    )
+                    bar_fig.update_traces(marker_line_color="#d6f4ff", marker_line_width=1.2, opacity=0.9)
+                    apply_plot_theme(bar_fig, "Multi-Horizon Comparison")
+                    st.plotly_chart(bar_fig, use_container_width=True)
+            else:
+                # Placeholder visualization when no forecasts are available
+                st.markdown("### Forecast Visualization Matrix")
+                ph = go.Figure()
+                ph.add_trace(go.Scatter(x=[0, 1], y=[None, None], mode="lines", name="No data"))
+                ph.update_layout(
+                    title=dict(text="No forecasts generated yet.", x=0.02, y=0.98, xanchor="left", yanchor="top"),
+                    paper_bgcolor="rgba(3, 12, 24, 0.35)",
+                    plot_bgcolor="rgba(6, 23, 39, 0.78)",
                 )
-            )
-            apply_plot_theme(avp, "Actual vs Predicted")
-            st.plotly_chart(avp, use_container_width=True)
-
-        with right_chart:
-            # 3) Horizon comparison chart with neon bars.
-            horizon_mean = result_df.mean().reset_index()
-            horizon_mean.columns = ["Horizon", "Mean Forecast"]
-
-            bar_fig = px.bar(
-                horizon_mean,
-                x="Horizon",
-                y="Mean Forecast",
-                color="Horizon",
-                color_discrete_map=FORECAST_COLORS,
-            )
-            bar_fig.update_traces(marker_line_color="#d6f4ff", marker_line_width=1.2, opacity=0.9)
-            apply_plot_theme(bar_fig, "Multi-Horizon Comparison")
-            st.plotly_chart(bar_fig, use_container_width=True)
+                apply_plot_theme(ph, "Forecast placeholder")
+                st.plotly_chart(ph, use_container_width=True)
+                st.info("No forecasts generated yet. Upload a valid dataset and click Generate Forecast. See 'User Guidelines' for dataset requirements.")
 
     # --------------------------------------------------------
     # TAB 3: RESEARCH PANELS + EXPANDABLE CARDS
@@ -1157,7 +1405,7 @@ if result_df is not None:
             with m2:
                 st.metric("Signal Smoothness", "Enabled" if smoothing_enabled else "Disabled")
             with m3:
-                st.metric("Inferred Samples", f"{len(result_df)}")
+                st.metric("Inferred Samples", f"{len(result_df) if result_df is not None else 0}")
             with m4:
                 st.metric("Hydro Drift Alert", "Low")
 
@@ -1171,18 +1419,17 @@ if result_df is not None:
                 """
             )
 
-        # Download remains available to preserve output workflow.
-        csv = result_df.to_csv(index=False)
-        st.download_button(
-            label="Download Predictions CSV",
-            data=csv,
-            file_name="predictions.csv",
-            mime="text/csv",
-        )
-
-else:
-    # Initial state guidance to keep app informative before running inference.
-    st.info("Upload a valid Excel dataset and click Generate Forecast in the sidebar.")
+        # Download remains available to preserve output workflow when forecasts exist.
+        if result_df is not None:
+            csv = result_df.to_csv(index=False)
+            st.download_button(
+                label="Download Predictions CSV",
+                data=csv,
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No predictions available to download.")
 
 
 # ============================================================
@@ -1222,6 +1469,7 @@ st.markdown(
         <div style="font-family:Orbitron, sans-serif; color:#c9f4ff; letter-spacing:0.4px;">
             Powered by Transformer Deep Learning Architecture
         </div>
+        <div style="margin-top:6px; color:#f9e6d6; font-weight:600;">⚠ This forecasting model has been trained specifically for the Kosi River Basin and should not be used for any other river basin.</div>
     </div>
     """,
     unsafe_allow_html=True,
